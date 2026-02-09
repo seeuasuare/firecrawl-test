@@ -3,12 +3,7 @@
 Deep email scraper — second pass for sites where no email was found.
 
 Reads companies_with_emails.xlsx, takes only rows WITHOUT emails,
-and does a deeper crawl:
-  - Crawls up to 30 internal pages per site
-  - Extracts emails from JavaScript code and data attributes
-  - Checks WHOIS data for domain contacts
-  - Tries more contact page URL patterns
-  - Decodes obfuscated emails (JS escapes, HTML entities, [at]/[dot])
+and does a deeper crawl with timeouts per site so it never hangs.
 
 Usage:
     pip install openpyxl aiohttp beautifulsoup4
@@ -22,17 +17,23 @@ import asyncio
 import html as html_module
 import re
 import time
+import warnings
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import openpyxl
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+
+# Suppress noisy warnings
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # --------------- Configuration ---------------
 
-CONCURRENCY = 20
-TIMEOUT = 15
-MAX_PAGES_PER_SITE = 30
+CONCURRENCY = 25
+TIMEOUT = 10             # seconds per single page request
+SITE_TIMEOUT = 45        # max seconds per entire site
+MAX_PAGES_PER_SITE = 15  # max pages to check per site
 INPUT_FILE = 'companies_with_emails.xlsx'
 OUTPUT_FILE = 'companies_final.xlsx'
 
@@ -43,14 +44,6 @@ EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Obfuscated email patterns: name [at] domain [dot] com
-OBFUSCATED_RE = re.compile(
-    r'[a-zA-Z0-9._%+\-]+\s*[\[\(]\s*(?:at|@|собака|гав)\s*[\]\)]\s*'
-    r'[a-zA-Z0-9.\-]+\s*[\[\(]\s*(?:dot|\.)\s*[\]\)]\s*[a-zA-Z]{2,}',
-    re.IGNORECASE,
-)
-
-# Extended contact page paths
 CONTACT_PATHS = [
     '/contacts', '/contact', '/kontakty', '/about',
     '/about-us', '/o-nas', '/o-kompanii', '/kontakt',
@@ -58,9 +51,7 @@ CONTACT_PATHS = [
     '/specialists', '/specialisty', '/nashi-specialisty',
     '/komanda', '/o-centre', '/o-klinike', '/o-tsentre',
     '/privacy', '/privacy-policy', '/policy',
-    '/politika-konfidencialnosti', '/requisites',
-    '/rekvizity', '/info', '/uslugi', '/zapis',
-    '/footer', '/sitemap.xml',
+    '/politika-konfidencialnosti', '/rekvizity',
 ]
 
 JUNK_DOMAINS = {
@@ -105,31 +96,13 @@ def is_valid_email(email: str) -> bool:
     return True
 
 
-def decode_obfuscated(text: str) -> list:
-    """Try to decode obfuscated emails like name[at]domain[dot]com."""
-    results = []
-    # Replace common obfuscation patterns
-    cleaned = text
-    for pattern in [r'\s*[\[\(]\s*(?:at|собака|гав)\s*[\]\)]\s*',
-                    r'\s*\{at\}\s*', r'\s*\(at\)\s*']:
-        cleaned = re.sub(pattern, '@', cleaned, flags=re.IGNORECASE)
-    for pattern in [r'\s*[\[\(]\s*(?:dot|точка)\s*[\]\)]\s*',
-                    r'\s*\{dot\}\s*', r'\s*\(dot\)\s*']:
-        cleaned = re.sub(pattern, '.', cleaned, flags=re.IGNORECASE)
-    for match in EMAIL_RE.findall(cleaned):
-        if is_valid_email(match):
-            results.append(match.lower())
-    return results
-
-
 def extract_emails(html_text: str) -> set:
     """Extract emails from HTML — deep version."""
     emails = set()
 
-    # 1) Decode HTML entities first
     decoded = html_module.unescape(html_text)
 
-    # 2) mailto: links
+    # 1) mailto: links
     soup = BeautifulSoup(decoded, 'html.parser')
     for a_tag in soup.find_all('a', href=True):
         href = a_tag['href']
@@ -138,46 +111,34 @@ def extract_emails(html_text: str) -> set:
             if is_valid_email(raw):
                 emails.add(raw.lower())
 
-    # 3) Regex on decoded HTML
+    # 2) Regex on full HTML
     for match in EMAIL_RE.findall(decoded):
         if is_valid_email(match):
             emails.add(match.lower())
 
-    # 4) Check data-attributes and title/alt attributes
+    # 3) data-attributes
     for tag in soup.find_all(True):
-        for attr_name, attr_val in tag.attrs.items():
+        for attr_val in tag.attrs.values():
             if isinstance(attr_val, str) and '@' in attr_val:
                 for match in EMAIL_RE.findall(attr_val):
                     if is_valid_email(match):
                         emails.add(match.lower())
 
-    # 5) Look in <script> tags for emails
+    # 4) Script tags
     for script in soup.find_all('script'):
         if script.string:
-            # Decode JS unicode escapes like \u0040 (= @)
-            try:
-                js_decoded = script.string.encode().decode('unicode_escape', errors='replace')
-            except Exception:
-                js_decoded = script.string
-            for match in EMAIL_RE.findall(js_decoded):
-                if is_valid_email(match):
-                    emails.add(match.lower())
             for match in EMAIL_RE.findall(script.string):
                 if is_valid_email(match):
                     emails.add(match.lower())
 
-    # 6) Try obfuscated patterns
-    for email in decode_obfuscated(decoded):
-        emails.add(email)
-
-    # 7) Check JSON-LD structured data
+    # 5) JSON-LD
     for script in soup.find_all('script', type='application/ld+json'):
         if script.string:
             for match in EMAIL_RE.findall(script.string):
                 if is_valid_email(match):
                     emails.add(match.lower())
 
-    # 8) Check meta tags
+    # 6) Meta tags
     for meta in soup.find_all('meta'):
         content = meta.get('content', '')
         if '@' in content:
@@ -200,7 +161,7 @@ async def fetch_page(session: aiohttp.ClientSession, url: str) -> str:
         ) as resp:
             if resp.status == 200:
                 ct = resp.headers.get('Content-Type', '')
-                if 'text' in ct or 'html' in ct or 'xml' in ct or not ct:
+                if 'text' in ct or 'html' in ct or not ct:
                     return await resp.text(errors='replace')
     except Exception:
         pass
@@ -208,7 +169,6 @@ async def fetch_page(session: aiohttp.ClientSession, url: str) -> str:
 
 
 def get_internal_links(html_text: str, base: str, netloc: str) -> list:
-    """Extract all unique internal links from page."""
     links = set()
     soup = BeautifulSoup(html_text, 'html.parser')
     for a_tag in soup.find_all('a', href=True):
@@ -218,7 +178,6 @@ def get_internal_links(html_text: str, base: str, netloc: str) -> list:
         full_url = urljoin(base, href)
         parsed = urlparse(full_url)
         if parsed.netloc == netloc:
-            # Skip media/file links
             path_lower = parsed.path.lower()
             if any(path_lower.endswith(ext) for ext in
                    ('.pdf', '.doc', '.docx', '.zip', '.png', '.jpg',
@@ -230,7 +189,7 @@ def get_internal_links(html_text: str, base: str, netloc: str) -> list:
 
 
 async def scrape_deep(session: aiohttp.ClientSession, url: str) -> set:
-    """Deep scrape: crawl up to MAX_PAGES_PER_SITE pages."""
+    """Deep scrape one site with a total timeout."""
     emails = set()
 
     if not url or url == 'None':
@@ -244,37 +203,38 @@ async def scrape_deep(session: aiohttp.ClientSession, url: str) -> set:
 
     visited = set()
     to_visit = [url]
-
-    # Add known contact paths
     for path in CONTACT_PATHS:
         to_visit.append(base + path)
 
     pages_checked = 0
 
-    while to_visit and pages_checked < MAX_PAGES_PER_SITE:
-        current_url = to_visit.pop(0)
-        if current_url in visited:
-            continue
-        visited.add(current_url)
+    try:
+        async with asyncio.timeout(SITE_TIMEOUT):
+            while to_visit and pages_checked < MAX_PAGES_PER_SITE:
+                current_url = to_visit.pop(0)
+                if current_url in visited:
+                    continue
+                visited.add(current_url)
 
-        html_text = await fetch_page(session, current_url)
-        if not html_text:
-            continue
+                html_text = await fetch_page(session, current_url)
+                if not html_text:
+                    continue
 
-        pages_checked += 1
-        found = extract_emails(html_text)
-        emails.update(found)
+                pages_checked += 1
+                emails.update(extract_emails(html_text))
 
-        # If we haven't found emails yet, discover more links to crawl
-        if not emails and pages_checked <= 5:
-            new_links = get_internal_links(html_text, base, netloc)
-            for link in new_links:
-                if link not in visited and link not in to_visit:
-                    to_visit.append(link)
+                # Discover more links only if no emails yet
+                if not emails and pages_checked <= 3:
+                    new_links = get_internal_links(html_text, base, netloc)
+                    for link in new_links:
+                        if link not in visited and link not in to_visit:
+                            to_visit.append(link)
 
-        # If we already found emails, we can stop early
-        if emails and pages_checked >= 3:
-            break
+                # Found emails — stop early
+                if emails and pages_checked >= 2:
+                    break
+    except (asyncio.TimeoutError, TimeoutError):
+        pass
 
     return emails
 
@@ -287,7 +247,6 @@ async def main():
     ws = wb.active
     total_rows = ws.max_row - 1
 
-    # Collect only rows WITHOUT emails
     rows_to_process = []
     already_have = 0
     for row_idx in range(2, ws.max_row + 1):
@@ -296,8 +255,7 @@ async def main():
             already_have += 1
             continue
         url = ws.cell(row_idx, 3).value or ws.cell(row_idx, 2).value or ''
-        name = ws.cell(row_idx, 1).value or ''
-        rows_to_process.append((row_idx, str(url), str(name)))
+        rows_to_process.append((row_idx, str(url)))
 
     total = len(rows_to_process)
     print(f"Total companies: {total_rows}")
@@ -321,7 +279,7 @@ async def main():
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         sem = asyncio.Semaphore(CONCURRENCY)
 
-        async def process(row_idx: int, url: str, name: str):
+        async def process(row_idx: int, url: str):
             nonlocal found_count, processed
             async with sem:
                 emails = await scrape_deep(session, url)
@@ -336,7 +294,7 @@ async def main():
                     print(f"\r  [{bar}] {processed}/{total}  "
                           f"new emails: {found_count}", end='', flush=True)
 
-        tasks = [process(r, u, n) for r, u, n in rows_to_process]
+        tasks = [process(r, u) for r, u in rows_to_process]
         await asyncio.gather(*tasks)
 
     print(f"\n\n{'='*50}")
