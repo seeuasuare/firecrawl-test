@@ -44,8 +44,12 @@ TIMEOUT = 12
 SITE_TIMEOUT = 50
 MONTHS_BACK = 3
 
-INPUT_FILE = '1000 + 86 клиник.xlsx'
-OUTPUT_FILE = '1000 + 86 клиник_result.xlsx'
+import os
+
+# Auto-detect input file name
+_CANDIDATES = ['1000 + 86 клиник.xlsx', '1000+86.xlsx']
+INPUT_FILE = next((f for f in _CANDIDATES if os.path.exists(f)), _CANDIDATES[0])
+OUTPUT_FILE = INPUT_FILE.replace('.xlsx', '_result.xlsx')
 
 # Column numbers (same for both sheets)
 COL_NAME = 1
