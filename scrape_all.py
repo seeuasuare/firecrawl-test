@@ -2,11 +2,16 @@
 """
 Unified scraper + auditor for "1000 + 86 клиник.xlsx".
 
-For both sheets ("86" and "1000"):
-  - Scrapes EMAILS for empty email cells only
-  - Scrapes PHONES for empty phone cells only
-  - Runs AUDIT (accessibility, theme, activity) for empty audit cells only
-  - Never overwrites already filled data
+Both sheets have identical columns:
+  1: Name  2: URL  3: Description  4: Emails  5: Phones
+  6: Сайт работает?  7: Тематика  8: Уверенность %
+  9: Детали тематики  10: Активность  11: Детали активности
+
+For each row (skipping already filled cells):
+  - Scrapes DESCRIPTION (meta description / og:description / first paragraph)
+  - Scrapes EMAILS from main + contact pages
+  - Scrapes PHONES from main + contact pages
+  - Runs AUDIT: accessibility, theme relevance, recent activity
 
 Usage:
     pip install openpyxl aiohttp beautifulsoup4
@@ -37,28 +42,67 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 CONCURRENCY = 25
 TIMEOUT = 12
 SITE_TIMEOUT = 50
-MAX_PAGES_PER_SITE = 12
 MONTHS_BACK = 3
 
 INPUT_FILE = '1000 + 86 клиник.xlsx'
 OUTPUT_FILE = '1000 + 86 клиник_result.xlsx'
 
-# Sheet column mappings: (url_col, email_col, phone_col, audit_start_col)
-# audit columns are: status, theme, confidence, theme_detail, activity, activity_detail
-SHEET_CONFIG = {
-    '86': {
-        'url_col': 3,        # Сайт
-        'email_col': 4,      # Email
-        'phone_col': None,   # No phone column
-        'audit_start': 5,    # Col 5: Сайт работает?
-    },
-    '1000': {
-        'url_col': 3,        # URL
-        'email_col': 5,      # Emails
-        'phone_col': 6,      # Phones
-        'audit_start': 7,    # Col 7: Сайт работает?
-    },
-}
+# Column numbers (same for both sheets)
+COL_NAME = 1
+COL_URL = 2
+COL_DESC = 3
+COL_EMAIL = 4
+COL_PHONE = 5
+COL_STATUS = 6
+COL_THEME = 7
+COL_CONFIDENCE = 8
+COL_THEME_DETAIL = 9
+COL_ACTIVITY = 10
+COL_ACTIVITY_DETAIL = 11
+
+GREEN = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+RED = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+YELLOW = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
+
+CONTACT_PATHS = [
+    '/contacts', '/contact', '/kontakty', '/about',
+    '/about-us', '/o-nas', '/o-kompanii', '/kontakt',
+    '/contact-us', '/svyaz', '/feedback', '/team',
+    '/specialists', '/specialisty', '/komanda',
+    '/o-centre', '/o-klinike', '/o-tsentre',
+    '/rekvizity', '/politika-konfidencialnosti',
+]
+
+
+# ===================== Description extraction =====================
+
+def extract_description(html):
+    """Extract site description from meta tags or first paragraph."""
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # 1) og:description
+    og = soup.find('meta', property='og:description')
+    if og and og.get('content', '').strip():
+        return og['content'].strip()[:500]
+
+    # 2) meta description
+    meta = soup.find('meta', attrs={'name': 'description'})
+    if meta and meta.get('content', '').strip():
+        return meta['content'].strip()[:500]
+
+    # 3) First meaningful <p> tag
+    for p in soup.find_all('p'):
+        text = p.get_text(strip=True)
+        if len(text) > 50:
+            return text[:500]
+
+    # 4) Title tag
+    title = soup.find('title')
+    if title and title.get_text(strip=True):
+        return title.get_text(strip=True)[:200]
+
+    return None
+
 
 # ===================== Email extraction =====================
 
@@ -86,15 +130,6 @@ JUNK_EMAIL_PREFIXES = (
 
 JUNK_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.css', '.js', '.woff'}
 
-CONTACT_PATHS = [
-    '/contacts', '/contact', '/kontakty', '/about',
-    '/about-us', '/o-nas', '/o-kompanii', '/kontakt',
-    '/contact-us', '/svyaz', '/feedback', '/team',
-    '/specialists', '/specialisty', '/komanda',
-    '/o-centre', '/o-klinike', '/o-tsentre',
-    '/rekvizity', '/politika-konfidencialnosti',
-]
-
 
 def is_valid_email(email):
     email = email.lower().strip()
@@ -115,50 +150,57 @@ def is_valid_email(email):
     return True
 
 
+def extract_emails(html):
+    emails = set()
+    decoded = html_module.unescape(html)
+    soup = BeautifulSoup(decoded, 'html.parser')
+
+    for a in soup.find_all('a', href=True):
+        if 'mailto:' in a['href']:
+            raw = a['href'].split('mailto:')[1].split('?')[0].split('#')[0].strip()
+            if is_valid_email(raw):
+                emails.add(raw.lower())
+
+    for m in EMAIL_RE.findall(decoded):
+        if is_valid_email(m):
+            emails.add(m.lower())
+
+    for tag in soup.find_all(True):
+        for v in tag.attrs.values():
+            if isinstance(v, str) and '@' in v:
+                for m in EMAIL_RE.findall(v):
+                    if is_valid_email(m):
+                        emails.add(m.lower())
+
+    for script in soup.find_all('script'):
+        if script.string:
+            for m in EMAIL_RE.findall(script.string):
+                if is_valid_email(m):
+                    emails.add(m.lower())
+
+    for script in soup.find_all('script', type='application/ld+json'):
+        if script.string:
+            for m in EMAIL_RE.findall(script.string):
+                if is_valid_email(m):
+                    emails.add(m.lower())
+
+    for meta in soup.find_all('meta'):
+        c = meta.get('content', '')
+        if '@' in c:
+            for m in EMAIL_RE.findall(c):
+                if is_valid_email(m):
+                    emails.add(m.lower())
+
+    return emails
+
+
 # ===================== Phone extraction =====================
 
-PHONE_RE = re.compile(
-    r'(?:\+7|8)[\s\-\(]*(?:\d[\s\-\)]*){10}'
-)
-
+PHONE_RE = re.compile(r'(?:\+7|8)[\s\-\(]*(?:\d[\s\-\)]*){10}')
 PHONE_CLEAN_RE = re.compile(r'[^\d+]')
 
 
-def extract_phones(html):
-    """Extract Russian phone numbers from HTML."""
-    phones = set()
-    soup = BeautifulSoup(html, 'html.parser')
-
-    # 1) tel: links
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href']
-        if 'tel:' in href:
-            raw = href.split('tel:')[1].split('?')[0].strip()
-            cleaned = PHONE_CLEAN_RE.sub('', raw)
-            if len(cleaned) >= 11:
-                phones.add(format_phone(cleaned))
-
-    # 2) Regex in text
-    text = soup.get_text(' ', strip=True)
-    for match in PHONE_RE.finditer(text):
-        raw = match.group(0)
-        cleaned = PHONE_CLEAN_RE.sub('', raw)
-        if len(cleaned) >= 11:
-            phones.add(format_phone(cleaned))
-
-    # 3) data-attributes and meta
-    for tag in soup.find_all(True):
-        for attr_val in tag.attrs.values():
-            if isinstance(attr_val, str) and ('tel:' in attr_val or re.search(r'\+7|^8\d{10}', attr_val)):
-                cleaned = PHONE_CLEAN_RE.sub('', attr_val)
-                if len(cleaned) >= 11:
-                    phones.add(format_phone(cleaned))
-
-    return phones
-
-
 def format_phone(digits):
-    """Normalize phone to +7XXXXXXXXXX format."""
     digits = digits.lstrip('+')
     if digits.startswith('8') and len(digits) == 11:
         digits = '7' + digits[1:]
@@ -167,51 +209,24 @@ def format_phone(digits):
     return f'+{digits}'
 
 
-# ===================== Email extraction (deep) =====================
+def extract_phones(html):
+    phones = set()
+    soup = BeautifulSoup(html, 'html.parser')
 
-def extract_emails(html):
-    emails = set()
-    decoded = html_module.unescape(html)
-    soup = BeautifulSoup(decoded, 'html.parser')
+    for a in soup.find_all('a', href=True):
+        if 'tel:' in a['href']:
+            raw = a['href'].split('tel:')[1].split('?')[0].strip()
+            cleaned = PHONE_CLEAN_RE.sub('', raw)
+            if len(cleaned) >= 11:
+                phones.add(format_phone(cleaned))
 
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href']
-        if 'mailto:' in href:
-            raw = href.split('mailto:')[1].split('?')[0].split('#')[0].strip()
-            if is_valid_email(raw):
-                emails.add(raw.lower())
+    text = soup.get_text(' ', strip=True)
+    for m in PHONE_RE.finditer(text):
+        cleaned = PHONE_CLEAN_RE.sub('', m.group(0))
+        if len(cleaned) >= 11:
+            phones.add(format_phone(cleaned))
 
-    for match in EMAIL_RE.findall(decoded):
-        if is_valid_email(match):
-            emails.add(match.lower())
-
-    for tag in soup.find_all(True):
-        for attr_val in tag.attrs.values():
-            if isinstance(attr_val, str) and '@' in attr_val:
-                for match in EMAIL_RE.findall(attr_val):
-                    if is_valid_email(match):
-                        emails.add(match.lower())
-
-    for script in soup.find_all('script'):
-        if script.string:
-            for match in EMAIL_RE.findall(script.string):
-                if is_valid_email(match):
-                    emails.add(match.lower())
-
-    for script in soup.find_all('script', type='application/ld+json'):
-        if script.string:
-            for match in EMAIL_RE.findall(script.string):
-                if is_valid_email(match):
-                    emails.add(match.lower())
-
-    for meta in soup.find_all('meta'):
-        content = meta.get('content', '')
-        if '@' in content:
-            for match in EMAIL_RE.findall(content):
-                if is_valid_email(match):
-                    emails.add(match.lower())
-
-    return emails
+    return phones
 
 
 # ===================== Theme checking =====================
@@ -249,19 +264,18 @@ def check_theme(html):
     if not html:
         return None, 0, 'Нет данных'
     text = BeautifulSoup(html, 'html.parser').get_text(' ', strip=True).lower()
-    anti_count = sum(1 for kw in ANTI_KEYWORDS if kw in text)
-    if anti_count >= 2:
+    if sum(1 for kw in ANTI_KEYWORDS if kw in text) >= 2:
         return False, 0, 'Другая тематика'
-    primary_found = [kw for kw in PRIMARY_KEYWORDS if kw in text]
-    secondary_found = [kw for kw in SECONDARY_KEYWORDS if kw in text]
-    if len(primary_found) >= 3:
-        return True, 100, f'Точное совпадение ({len(primary_found)} ключевых слов)'
-    elif len(primary_found) >= 1:
-        conf = min(50 + len(primary_found) * 20 + len(secondary_found) * 10, 100)
-        return True, conf, f'Совпадение ({len(primary_found)} осн. + {len(secondary_found)} доп.)'
-    elif len(secondary_found) >= 2:
-        return True, 40, f'Возможное совпадение ({len(secondary_found)} доп. слов)'
-    elif len(secondary_found) == 1:
+    pf = [kw for kw in PRIMARY_KEYWORDS if kw in text]
+    sf = [kw for kw in SECONDARY_KEYWORDS if kw in text]
+    if len(pf) >= 3:
+        return True, 100, f'Точное совпадение ({len(pf)} ключевых слов)'
+    if len(pf) >= 1:
+        c = min(50 + len(pf) * 20 + len(sf) * 10, 100)
+        return True, c, f'Совпадение ({len(pf)} осн. + {len(sf)} доп.)'
+    if len(sf) >= 2:
+        return True, 40, f'Возможное совпадение ({len(sf)} доп. слов)'
+    if len(sf) == 1:
         return None, 20, 'Слабое совпадение (1 общее слово)'
     return False, 0, 'Не соответствует тематике'
 
@@ -275,29 +289,29 @@ RUSSIAN_MONTHS = {
 }
 
 DATE_PATTERNS = [
-    re.compile(r'(\d{1,2})\s+(' + '|'.join(RUSSIAN_MONTHS.keys()) + r')[а-яё]*\s+(\d{4})', re.IGNORECASE),
+    re.compile(r'(\d{1,2})\s+(' + '|'.join(RUSSIAN_MONTHS.keys()) + r')[а-яё]*\s+(\d{4})', re.I),
     re.compile(r'(\d{1,2})[./](\d{1,2})[./](\d{4})'),
     re.compile(r'(\d{4})-(\d{2})-(\d{2})'),
 ]
 
-COPYRIGHT_RE = re.compile(r'©\s*(?:\d{4}\s*[-–—]\s*)?(\d{4})', re.IGNORECASE)
+COPYRIGHT_RE = re.compile(r'©\s*(?:\d{4}\s*[-–—]\s*)?(\d{4})', re.I)
 
 
 def parse_date(match, idx):
     try:
         if idx == 0:
-            day, month_text, year = int(match.group(1)), match.group(2).lower(), int(match.group(3))
-            month = next((v for k, v in RUSSIAN_MONTHS.items() if month_text.startswith(k)), None)
-            if month and 2000 <= year <= 2030:
-                return datetime(year, month, day)
+            d, mt, y = int(match.group(1)), match.group(2).lower(), int(match.group(3))
+            mo = next((v for k, v in RUSSIAN_MONTHS.items() if mt.startswith(k)), None)
+            if mo and 2000 <= y <= 2030:
+                return datetime(y, mo, d)
         elif idx == 1:
-            d, m, y = int(match.group(1)), int(match.group(2)), int(match.group(3))
-            if 2000 <= y <= 2030 and 1 <= m <= 12:
-                return datetime(y, m, d)
+            d, mo, y = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            if 2000 <= y <= 2030 and 1 <= mo <= 12:
+                return datetime(y, mo, d)
         elif idx == 2:
-            y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
-            if 2000 <= y <= 2030 and 1 <= m <= 12:
-                return datetime(y, m, d)
+            y, mo, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            if 2000 <= y <= 2030 and 1 <= mo <= 12:
+                return datetime(y, mo, d)
     except (ValueError, IndexError):
         pass
     return None
@@ -312,9 +326,9 @@ def check_activity(html, headers):
     if lm:
         try:
             from email.utils import parsedate_to_datetime
-            lm_date = parsedate_to_datetime(lm).replace(tzinfo=None)
-            if lm_date >= cutoff:
-                results.append(f'Last-Modified: {lm_date.strftime("%d.%m.%Y")}')
+            lm_dt = parsedate_to_datetime(lm).replace(tzinfo=None)
+            if lm_dt >= cutoff:
+                results.append(f'Last-Modified: {lm_dt.strftime("%d.%m.%Y")}')
         except Exception:
             pass
 
@@ -322,7 +336,6 @@ def check_activity(html, headers):
         return (True, '; '.join(results)) if results else (None, 'Нет данных')
 
     text = BeautifulSoup(html, 'html.parser').get_text(' ', strip=True)
-
     dates = []
     for i, pat in enumerate(DATE_PATTERNS):
         for m in pat.finditer(text):
@@ -332,8 +345,7 @@ def check_activity(html, headers):
 
     recent = [d for d in dates if cutoff <= d <= now + timedelta(days=30)]
     if recent:
-        latest = max(recent)
-        results.append(f'Дата на сайте: {latest.strftime("%d.%m.%Y")} ({len(recent)} свежих)')
+        results.append(f'Дата на сайте: {max(recent).strftime("%d.%m.%Y")} ({len(recent)} свежих)')
 
     cr = COPYRIGHT_RE.search(text)
     if cr:
@@ -347,10 +359,8 @@ def check_activity(html, headers):
         return True, '; '.join(results)
     if dates:
         return False, f'Последняя дата: {max(dates).strftime("%d.%m.%Y")}'
-    if cr:
-        yr = int(cr.group(1))
-        if yr < now.year - 1:
-            return False, f'Copyright {yr} (устаревший)'
+    if cr and int(cr.group(1)) < now.year - 1:
+        return False, f'Copyright {int(cr.group(1))} (устаревший)'
     return None, 'Нет признаков активности'
 
 
@@ -376,37 +386,34 @@ async def fetch_page(session, url):
 
 
 async def fetch_contact_pages(session, base_url, main_html, netloc):
-    """Fetch contact-like pages and return combined HTML."""
-    extra_html = []
+    extra = []
     checked = set()
 
-    # Links found on main page
     if main_html:
         soup = BeautifulSoup(main_html, 'html.parser')
-        keywords = ['contact', 'kontakt', 'контакт', 'связ', 'о нас', 'about', 'обратн', 'напис']
+        kws = ['contact', 'kontakt', 'контакт', 'связ', 'о нас', 'about', 'обратн', 'напис']
         for a in soup.find_all('a', href=True):
-            href_lower = a['href'].lower()
-            text_lower = (a.get_text() or '').lower()
-            if any(kw in href_lower or kw in text_lower for kw in keywords):
+            hl = a['href'].lower()
+            tl = (a.get_text() or '').lower()
+            if any(k in hl or k in tl for k in kws):
                 full = urljoin(base_url, a['href'])
                 if urlparse(full).netloc == netloc and full not in checked:
                     checked.add(full)
                     _, h, _ = await fetch_page(session, full)
                     if h:
-                        extra_html.append(h)
+                        extra.append(h)
                     if len(checked) >= 5:
                         break
 
-    # Common paths
     for path in CONTACT_PATHS[:10]:
-        curl = base_url + path
-        if curl not in checked:
-            checked.add(curl)
-            _, h, _ = await fetch_page(session, curl)
+        cu = base_url + path
+        if cu not in checked:
+            checked.add(cu)
+            _, h, _ = await fetch_page(session, cu)
             if h:
-                extra_html.append(h)
+                extra.append(h)
 
-    return extra_html
+    return extra
 
 
 def status_text(code):
@@ -423,15 +430,19 @@ def status_text(code):
 
 # ===================== Process one row =====================
 
-async def process_row(session, url, need_email, need_phone, need_audit):
-    """Process a single site. Returns (emails, phones, audit_data)."""
-    emails = set()
-    phones = set()
-    audit = None
+def cell_empty(ws, row, col):
+    v = ws.cell(row, col).value
+    return not v or not str(v).strip()
 
-    if not url or url == 'None' or url == 'EMPTY':
-        return None, None, None
 
+async def process_row(session, url, needs):
+    """needs = dict with keys: desc, email, phone, audit (booleans)"""
+    result = {}
+
+    if not url or url.strip() in ('', 'None'):
+        return result
+
+    url = url.strip()
     if not url.startswith('http'):
         url = 'https://' + url
 
@@ -439,166 +450,170 @@ async def process_row(session, url, need_email, need_phone, need_audit):
     base = f"{parsed.scheme}://{parsed.netloc}"
     netloc = parsed.netloc
 
-    # Fetch main page
     try:
         async with asyncio.timeout(SITE_TIMEOUT):
             status_code, main_html, headers = await fetch_page(session, url)
 
             all_html = [main_html] if main_html else []
 
-            # Fetch contact pages if we need email or phone
-            if main_html and (need_email or need_phone):
+            # Fetch contact pages if needed
+            if main_html and (needs.get('email') or needs.get('phone')):
                 extra = await fetch_contact_pages(session, base, main_html, netloc)
                 all_html.extend(extra)
 
-            # Extract emails
-            if need_email:
+            # Description
+            if needs.get('desc') and main_html:
+                desc = extract_description(main_html)
+                if desc:
+                    result['desc'] = desc
+
+            # Emails
+            if needs.get('email'):
+                emails = set()
                 for h in all_html:
                     emails.update(extract_emails(h))
+                if emails:
+                    result['emails'] = ', '.join(sorted(emails))
 
-            # Extract phones
-            if need_phone:
+            # Phones
+            if needs.get('phone'):
+                phones = set()
                 for h in all_html:
                     phones.update(extract_phones(h))
+                if phones:
+                    result['phones'] = ', '.join(sorted(phones))
 
             # Audit
-            if need_audit:
+            if needs.get('audit'):
                 st = status_text(status_code)
-                theme, theme_conf, theme_detail = check_theme(main_html)
-                active, active_detail = check_activity(main_html, headers)
-                audit = (st, status_code, theme, theme_conf, theme_detail, active, active_detail)
+                theme, conf, theme_det = check_theme(main_html)
+                active, active_det = check_activity(main_html, headers)
+                result['audit'] = (st, status_code, theme, conf, theme_det, active, active_det)
 
     except (asyncio.TimeoutError, TimeoutError):
-        if need_audit:
-            audit = ('Не открывается (таймаут)', -1, None, 0, 'Нет данных', None, 'Нет данных')
+        if needs.get('audit'):
+            result['audit'] = ('Не открывается (таймаут)', -1, None, 0, 'Нет данных', None, 'Нет данных')
 
-    return emails or None, phones or None, audit
+    return result
 
 
 # ===================== Main =====================
 
-GREEN = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
-RED = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
-YELLOW = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
-
-
-async def process_sheet(session, ws, config, sheet_name):
-    """Process one sheet."""
-    total = ws.max_row - 1
-    if total <= 0:
-        print(f"  Sheet '{sheet_name}': empty, skipping")
-        return
-
-    url_col = config['url_col']
-    email_col = config['email_col']
-    phone_col = config['phone_col']
-    audit_start = config['audit_start']
-
-    # Count what needs processing
-    rows_to_process = []
-    skip_count = 0
-    for row_idx in range(2, ws.max_row + 1):
-        url = ws.cell(row_idx, url_col).value
+async def process_sheet(session, ws, sheet_name):
+    # Find actual rows (skip empty rows)
+    rows_data = []
+    for r in range(2, ws.max_row + 1):
+        url = ws.cell(r, COL_URL).value
         if not url or not str(url).strip():
-            skip_count += 1
             continue
+        rows_data.append(r)
 
-        url = str(url).strip()
+    total = len(rows_data)
+    print(f"\n  Sheet '{sheet_name}': {total} companies with URLs")
 
-        need_email = email_col and (not ws.cell(row_idx, email_col).value or
-                                     not str(ws.cell(row_idx, email_col).value).strip())
-        need_phone = phone_col and (not ws.cell(row_idx, phone_col).value or
-                                     not str(ws.cell(row_idx, phone_col).value).strip())
-        # Audit: check if "Сайт работает?" column is empty
-        need_audit = not ws.cell(row_idx, audit_start).value or \
-                     not str(ws.cell(row_idx, audit_start).value).strip()
+    # Determine what each row needs
+    tasks_list = []
+    for r in rows_data:
+        needs = {
+            'desc': cell_empty(ws, r, COL_DESC),
+            'email': cell_empty(ws, r, COL_EMAIL),
+            'phone': cell_empty(ws, r, COL_PHONE),
+            'audit': cell_empty(ws, r, COL_STATUS),
+        }
+        if any(needs.values()):
+            tasks_list.append((r, str(ws.cell(r, COL_URL).value).strip(), needs))
 
-        if not need_email and not need_phone and not need_audit:
-            skip_count += 1
-            continue
+    to_process = len(tasks_list)
+    need_desc = sum(1 for _, _, n in tasks_list if n['desc'])
+    need_email = sum(1 for _, _, n in tasks_list if n['email'])
+    need_phone = sum(1 for _, _, n in tasks_list if n['phone'])
+    need_audit = sum(1 for _, _, n in tasks_list if n['audit'])
 
-        rows_to_process.append((row_idx, url, need_email, need_phone, need_audit))
-
-    to_process = len(rows_to_process)
-    print(f"  Sheet '{sheet_name}': {total} rows, {to_process} to process, {skip_count} already filled")
+    print(f"  To process: {to_process} rows")
+    print(f"    Descriptions: {need_desc}")
+    print(f"    Emails:       {need_email}")
+    print(f"    Phones:       {need_phone}")
+    print(f"    Audit:        {need_audit}")
 
     if to_process == 0:
+        print("  Nothing to do!")
         return
 
     processed = 0
-    email_found = 0
-    phone_found = 0
+    counts = {'desc': 0, 'email': 0, 'phone': 0}
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    async def do_row(row_idx, url, need_email, need_phone, need_audit):
-        nonlocal processed, email_found, phone_found
+    async def do_row(row_idx, url, needs):
+        nonlocal processed
         async with sem:
-            emails, phones, audit = await process_row(
-                session, url, need_email, need_phone, need_audit
-            )
+            result = await process_row(session, url, needs)
 
-            if emails and need_email:
-                ws.cell(row_idx, email_col).value = ', '.join(sorted(emails))
-                email_found += 1
+            if 'desc' in result:
+                ws.cell(row_idx, COL_DESC).value = result['desc']
+                counts['desc'] += 1
 
-            if phones and need_phone:
-                ws.cell(row_idx, phone_col).value = ', '.join(sorted(phones))
-                phone_found += 1
+            if 'emails' in result:
+                ws.cell(row_idx, COL_EMAIL).value = result['emails']
+                counts['email'] += 1
 
-            if audit and need_audit:
-                st, st_code, theme, theme_conf, theme_det, active, active_det = audit
-                ac = audit_start
+            if 'phones' in result:
+                ws.cell(row_idx, COL_PHONE).value = result['phones']
+                counts['phone'] += 1
 
-                ws.cell(row_idx, ac).value = st
+            if 'audit' in result:
+                st, st_code, theme, conf, theme_det, active, active_det = result['audit']
+
+                ws.cell(row_idx, COL_STATUS).value = st
                 if st_code == 200:
-                    ws.cell(row_idx, ac).fill = GREEN
+                    ws.cell(row_idx, COL_STATUS).fill = GREEN
                 elif st_code > 0:
-                    ws.cell(row_idx, ac).fill = YELLOW
+                    ws.cell(row_idx, COL_STATUS).fill = YELLOW
                 else:
-                    ws.cell(row_idx, ac).fill = RED
+                    ws.cell(row_idx, COL_STATUS).fill = RED
 
                 if theme is True:
-                    ws.cell(row_idx, ac+1).value = 'Да'
-                    ws.cell(row_idx, ac+1).fill = GREEN
+                    ws.cell(row_idx, COL_THEME).value = 'Да'
+                    ws.cell(row_idx, COL_THEME).fill = GREEN
                 elif theme is False:
-                    ws.cell(row_idx, ac+1).value = 'Нет'
-                    ws.cell(row_idx, ac+1).fill = RED
+                    ws.cell(row_idx, COL_THEME).value = 'Нет'
+                    ws.cell(row_idx, COL_THEME).fill = RED
                 else:
-                    ws.cell(row_idx, ac+1).value = 'Неясно'
-                    ws.cell(row_idx, ac+1).fill = YELLOW
+                    ws.cell(row_idx, COL_THEME).value = 'Неясно'
+                    ws.cell(row_idx, COL_THEME).fill = YELLOW
 
-                ws.cell(row_idx, ac+2).value = theme_conf
-                ws.cell(row_idx, ac+3).value = theme_det
+                ws.cell(row_idx, COL_CONFIDENCE).value = conf
+                ws.cell(row_idx, COL_THEME_DETAIL).value = theme_det
 
                 if active is True:
-                    ws.cell(row_idx, ac+4).value = 'Активен'
-                    ws.cell(row_idx, ac+4).fill = GREEN
+                    ws.cell(row_idx, COL_ACTIVITY).value = 'Активен'
+                    ws.cell(row_idx, COL_ACTIVITY).fill = GREEN
                 elif active is False:
-                    ws.cell(row_idx, ac+4).value = 'Неактивен'
-                    ws.cell(row_idx, ac+4).fill = RED
+                    ws.cell(row_idx, COL_ACTIVITY).value = 'Неактивен'
+                    ws.cell(row_idx, COL_ACTIVITY).fill = RED
                 else:
-                    ws.cell(row_idx, ac+4).value = 'Неизвестно'
-                    ws.cell(row_idx, ac+4).fill = YELLOW
+                    ws.cell(row_idx, COL_ACTIVITY).value = 'Неизвестно'
+                    ws.cell(row_idx, COL_ACTIVITY).fill = YELLOW
 
-                ws.cell(row_idx, ac+5).value = active_det
+                ws.cell(row_idx, COL_ACTIVITY_DETAIL).value = active_det
 
             processed += 1
             if processed % 15 == 0 or processed == to_process:
                 pct = processed * 100 // to_process
                 bar = '\u2588' * (pct // 5) + '\u2591' * (20 - pct // 5)
                 print(f"\r  [{bar}] {processed}/{to_process}  "
-                      f"emails: +{email_found}  phones: +{phone_found}",
+                      f"desc:+{counts['desc']} email:+{counts['email']} "
+                      f"phone:+{counts['phone']}",
                       end='', flush=True)
 
-    tasks = [do_row(r, u, ne, np_, na) for r, u, ne, np_, na in rows_to_process]
+    tasks = [do_row(r, u, n) for r, u, n in tasks_list]
     await asyncio.gather(*tasks)
 
-    print(f"\n  => Done! Emails: +{email_found}, Phones: +{phone_found}\n")
+    print(f"\n  => Done! desc:+{counts['desc']}  email:+{counts['email']}  phone:+{counts['phone']}")
 
 
 async def main():
-    print(f"Loading {INPUT_FILE}...\n")
+    print(f"Loading {INPUT_FILE}...")
     wb = openpyxl.load_workbook(INPUT_FILE)
 
     connector = aiohttp.TCPConnector(limit=CONCURRENCY, ssl=False)
@@ -614,15 +629,12 @@ async def main():
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         for sheet_name in wb.sheetnames:
-            if sheet_name in SHEET_CONFIG:
-                print(f"Processing sheet: {sheet_name}")
-                ws = wb[sheet_name]
-                await process_sheet(session, ws, SHEET_CONFIG[sheet_name], sheet_name)
-            else:
-                print(f"Skipping unknown sheet: {sheet_name}")
+            await process_sheet(session, wb[sheet_name], sheet_name)
 
     wb.save(OUTPUT_FILE)
-    print(f"Results saved to: {OUTPUT_FILE}")
+    print(f"\n{'='*55}")
+    print(f"  Results saved to: {OUTPUT_FILE}")
+    print(f"{'='*55}")
 
 
 if __name__ == '__main__':
